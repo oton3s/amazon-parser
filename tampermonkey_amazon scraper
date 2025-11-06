@@ -1,0 +1,298 @@
+// ==UserScript==
+// @name         Amazon Scraper 2010 bis 2025)
+// @namespace    local.amazon.orders
+// @version      4.0.0
+// @description  Lädt für alle Jahre von HEUTE bis 2010 alle Seiten (?startIndex=0,10,20,…) via versteckten iframes, bis KEINE NEUEN orderIDs mehr kommen. Robuste Totals + Dedupe.
+// @match        *://*.amazon.de/your-orders/orders*
+// @run-at       document-idle
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  /*** KONFIG ***/
+  const START_YEAR = 2010;
+  const END_YEAR = new Date().getFullYear();
+  const YEARS = Array.from({ length: END_YEAR - START_YEAR + 1 }, (_, i) => END_YEAR - i); // z.B. [2025, 2024, ..., 2010]
+  const STEP = 10;                 // Amazon paginiert in 10er-Schritten
+  const LOAD_TIMEOUT_MS = 20000;   // Timeout pro Seite
+  const MAX_PAGES_PER_YEAR = 800;  // Safety
+  /*** UI ***/
+  const statusEl = document.createElement('div');
+  Object.assign(statusEl.style, {
+    position:'fixed', right:'14px', top:'14px', zIndex:2147483647,
+    background:'rgba(0,0,0,.85)', color:'#fff', padding:'8px 10px',
+    borderRadius:'8px', fontSize:'12px', fontFamily:'system-ui, Arial',
+    maxWidth:'42vw', whiteSpace:'pre-wrap'
+  });
+  statusEl.textContent = 'Bereit';
+  document.body.appendChild(statusEl);
+
+  const btn = document.createElement('button');
+  btn.textContent = 'Orders ➜ Export';
+  Object.assign(btn.style, {
+    position:'fixed', right:'14px', bottom:'14px', zIndex:2147483647,
+    padding:'10px 14px', borderRadius:'10px', border:'1px solid #bbb',
+    background:'#ffd814', cursor:'pointer', fontSize:'14px',
+    boxShadow:'0 2px 8px rgba(0,0,0,.2)'
+  });
+  document.body.appendChild(btn);
+
+  /*** Utils ***/
+  const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
+  const txt = (el)=>{ try { return String(el ? (el.textContent ?? el.innerText ?? '') : '').trim(); } catch { return ''; } };
+  const abs = (u)=>{ try { return new URL(u, location.href).href; } catch { return u || ''; } };
+  const esc = (s)=>String(s).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'","&#039;");
+  const fmtCents = (c)=>{ const v=(c/100).toFixed(2); const [e,d]=v.split('.'); return `${e.replace(/\B(?=(\d{3})+(?!\d))/g,'.')},${d}`; };
+  function parseEuro(s){
+    if(!s) return 0;
+    s = String(s).replace(/\s+/g,' ').replace(/[€EUR]/gi,'')
+      .replace(/Summe|Gesamt|Zwischensumme|Bestellsumme|Order\s*total|Total|Amount/gi,'')
+      .trim().replace(/\./g,'').replace(',', '.');
+    const v = parseFloat(s);
+    return Number.isFinite(v) ? Math.round(v*100) : 0;
+  }
+  const yearUrl = (year, startIndex=0) =>
+    `https://www.amazon.de/your-orders/orders?timeFilter=year-${year}&startIndex=${startIndex}`;
+
+  function loadInHiddenIframe(url){
+    return new Promise((resolve)=>{
+      const iframe = document.createElement('iframe');
+      Object.assign(iframe.style,{width:'0',height:'0',border:'0',position:'absolute',left:'-9999px',top:'-9999px'});
+      iframe.src = url;
+      const done = (doc)=>{ setTimeout(()=>iframe.remove(),0); resolve(doc); };
+      const timer = setTimeout(()=>done(document.implementation.createHTMLDocument('timeout')), LOAD_TIMEOUT_MS);
+      iframe.addEventListener('load',()=>{
+        clearTimeout(timer);
+        const doc = iframe.contentDocument ? iframe.contentDocument.cloneNode(true)
+                                           : document.implementation.createHTMLDocument('blank');
+        done(doc);
+      },{once:true});
+      document.body.appendChild(iframe);
+    });
+  }
+
+  /*** DOM-Parser ***/
+  function getOrderCards(doc){
+    const set = new Set();
+    doc.querySelectorAll('a[href*="order-details"], a[href*="orderID="]').forEach(a=>{
+      const c = a.closest('[data-test-id="order-card"], .yohtmlc-order-group, .order-card, .a-box-group, .order') || a.parentElement;
+      if (c) set.add(c);
+    });
+    if (set.size === 0) {
+      doc.querySelectorAll('#ordersContainer .a-box-group, .yohtmlc-order-group, .order-card, .order, .a-box-group.a-spacing-base')
+        .forEach(n=>set.add(n));
+    }
+    return Array.from(set);
+  }
+  function getOrderIdFromLink(href){
+    try {
+      const u = new URL(href, location.href);
+      return u.searchParams.get('orderID') || u.pathname.match(/order-details\/([^/?#]+)/)?.[1] || href;
+    } catch { return href; }
+  }
+  function findOrderTotalCents(card){
+    const euros = [];
+    const explicit = card.querySelector('[data-test-id="order-total"], [data-test-id="grand-total-price"]');
+    if (explicit) { const v = parseEuro(txt(explicit)); if (v>0) euros.push(v); }
+    const labelWords = /(gesamt|summe|bestellsumme|order\s*total|total)/i;
+    card.querySelectorAll('*').forEach(el=>{
+      const t = txt(el);
+      if (t && labelWords.test(t)) {
+        const ctx = [t, txt(el.nextElementSibling), txt(el.parentElement)].filter(Boolean).join(' ');
+        const m = ctx.match(/(\d{1,3}(?:\.\d{3})*|\d+),\d{2}\s*(€|EUR)?/g);
+        if (m) m.forEach(s=>{ const c = parseEuro(s); if (c>0) euros.push(c); });
+      }
+    });
+    if (euros.length === 0) {
+      const m = txt(card).match(/(\d{1,3}(?:\.\d{3})*|\d+),\d{2}\s*(€|EUR)?/g);
+      if (m) m.forEach(s=>{ const c = parseEuro(s); if (c>0) euros.push(c); });
+    }
+    return euros.length ? Math.max(...euros) : 0;
+  }
+  function extractOrdersFromDoc(doc, yearFilter){
+    const cards = getOrderCards(doc);
+    const out = [];
+    for (const card of cards) {
+      try{
+        const linkEl = card.querySelector('a[href*="order-details"], a[href*="orderID="]');
+        const link = linkEl ? abs(linkEl.getAttribute('href')) : '';
+        const orderId = link ? getOrderIdFromLink(link) : txt(card).slice(0,120);
+
+        const yearInCard = (() => {
+          const m = txt(card).match(/(20\d{2}|201\d)/); // 2010–2099
+          return m ? parseInt(m[1],10) : null;
+        })();
+        if (yearFilter && yearInCard && yearInCard !== yearFilter) continue;
+
+        let dateText = '';
+        const mDate = txt(card).match(/(\d{1,2}\.\s*[A-Za-zÄÖÜäöü]+\.?\s*\d{4}|\d{1,2}\.\d{1,2}\.\d{2,4}|\d{4}-\d{2}-\d{2})/);
+        if (mDate) dateText = mDate[1];
+
+        const names = [];
+        const seen = new Set();
+        card.querySelectorAll('a[href*="/dp/"], a[href*="/gp/product"]').forEach(a=>{
+          const t = txt(a); if (t && t.length>1 && !seen.has(t)) { names.push(t); seen.add(t); }
+        });
+
+        const cent = findOrderTotalCents(card);
+        const products = Math.max(names.length, 1);
+
+        if (link || cent>0 || names.length>0 || dateText) {
+          out.push({ orderId, link, price: cent? null : '0,00', cent, date: dateText || '?', names, products, year: yearFilter || yearInCard });
+        }
+      }catch(e){ console.warn('[AMZ Orders] Karte übersprungen:', e); }
+    }
+    return out;
+  }
+
+  /*** Seitenlader: 0,10,20,… bis KEINE NEUEN IDs mehr ***/
+  async function fetchAllPagesForYear(year){
+    const docs = [];
+    const seenIds = new Set();
+    let start = 0;
+    let pages = 0;
+
+    while (pages < MAX_PAGES_PER_YEAR) {
+      const url = yearUrl(year, start);
+      const doc = await loadInHiddenIframe(url);
+      const cards = getOrderCards(doc);
+
+      statusEl.textContent = `Jahr ${year}: startIndex=${start} → ${cards.length} Karten`;
+
+      if (cards.length === 0) break;
+
+      // neue IDs?
+      const idsOnPage = new Set();
+      doc.querySelectorAll('a[href*="order-details"], a[href*="orderID="]').forEach(a=>{
+        const href = a.getAttribute('href') || '';
+        const id = getOrderIdFromLink(href);
+        if (id) idsOnPage.add(id);
+      });
+      const newIds = [...idsOnPage].filter(id => !seenIds.has(id));
+
+      if (newIds.length === 0) {
+        statusEl.textContent += `\n(keine neuen Bestellungen – Stop)`;
+        break;
+      }
+
+      newIds.forEach(id => seenIds.add(id));
+      docs.push(doc);
+
+      start += STEP;       // immer weiter, unabhängig von cards.length
+      pages += 1;
+      await sleep(120);
+    }
+    return docs;
+  }
+
+  /*** Report ***/
+  function renderReport(allOrders){
+    // Dedupe pro orderId
+    const byId = new Map();
+    for (const o of allOrders) if (!byId.has(o.orderId)) byId.set(o.orderId, o);
+    const orders = Array.from(byId.values());
+
+    // Jahr-Stats
+    const yearInit = YEARS.map(y => ({ name:String(y), cent:0, orders:0, products:0, month:12 }));
+    const mapYear = new Map(yearInit.map(y => [y.name, y]));
+    for (const o of orders) {
+      const yStr = String(o.year || '').match(/(20\d{2}|201\d)/)?.[1] || String(o.date).match(/(20\d{2}|201\d)/)?.[1];
+      if (yStr && mapYear.has(yStr)) {
+        const yy = mapYear.get(yStr);
+        yy.cent += o.cent||0; yy.orders += 1; yy.products += o.products||0;
+      }
+    }
+    const years = YEARS.map(y=>mapYear.get(String(y)));
+    const overall = years.reduce((a,y)=>{a.cent+=y.cent;a.orders+=y.orders;a.products+=y.products;a.month+=y.month;return a;},{name:'Insg.',cent:0,orders:0,products:0,month:0});
+
+    const css = `
+      body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:20px;}
+      table{border-collapse:collapse;width:100%;margin-bottom:24px;}
+      th,td{border:1px solid #ddd;padding:8px;vertical-align:top;}
+      th{background:#f6f6f6;text-align:left;}
+      .right{text-align:right}.center{text-align:center}.small{font-size:12px;color:#666}
+      ul{margin:0;padding:0 0 0 1.25em} h2{margin-top:24px}
+      a{color:#007185;text-decoration:none} a:hover{text-decoration:underline}
+    `;
+    const row = d => `
+      <tr>
+        <td class="right">${d.name}</td>
+        <td class="right">${fmtCents(d.cent)}</td>
+        <td class="right">${d.orders}</td>
+        <td class="right">${d.products}</td>
+        <td class="right">${d.products ? fmtCents(Math.round(d.cent/d.products)) : '0,00'}</td>
+        <td class="right">${fmtCents(Math.round(d.cent/(d.month||12)))}</td>
+      </tr>`;
+    const orderRow = o => `
+      <tr>
+        <td class="center">${o.link ? `<a href="${o.link}" target="_blank" rel="noopener">Link</a>` : '-'}</td>
+        <td class="right">${esc(o.date)}</td>
+        <td class="center">${o.products || 1}</td>
+        <td class="right">${o.cent ? fmtCents(o.cent) : (o.price || '0,00')}</td>
+        <td>${o.names && o.names.length ? `<ul>${o.names.map(n=>`<li>${esc(n)}</li>`).join('')}</ul>` : '-'}</td>
+      </tr>`;
+
+    const win = window.open('', '_blank');
+    const now = new Date();
+    win.document.open();
+    win.document.write(`
+      <html><head><meta charset="utf-8"><title>Amazon Bestellungen – Übersicht (${YEARS.join('–')})</title>
+      <style>${css}</style></head><body>
+      <h1>Amazon Bestellungen – Übersicht <span class="small">(Jahre: ${YEARS.join(', ')})</span></h1>
+      <p class="small">Stand: ${now.toLocaleString('de-DE')}. Werte aus der Bestellübersicht; Abweichungen möglich.</p>
+
+      <h2>Übersicht</h2>
+      <table>
+        <tr><th>Jahr</th><th>Euro</th><th>Bestell.</th><th>Produkte</th><th>Euro/Prod.</th><th>Euro/Monat</th></tr>
+        ${row({...overall, name:'Insg.'})}
+        ${years.map(row).join('')}
+      </table>
+
+      <h2>Einzel-Bestellungen</h2>
+      <table>
+        <tr><th>Link</th><th>Datum</th><th>Produkte</th><th>Preis</th><th>Produktbeschreibungen</th></tr>
+        ${orders
+          .filter(o => YEARS.includes(Number(o.year) || Number(String(o.date).match(/(20\d{2}|201\d)/)?.[1]) ))
+          .map(orderRow).join('')}
+      </table>
+      </body></html>
+    `);
+    win.document.close();
+  }
+
+  /*** Ablauf ***/
+  btn.addEventListener('click', async () => {
+    btn.disabled = true; btn.textContent = 'Läuft…'; statusEl.textContent = 'Starte…';
+
+    try {
+      const allPages = [];
+      for (const y of YEARS) {
+        statusEl.textContent = `Jahr ${y}: Seiten 0,10,20,… laden, bis keine neuen IDs mehr kommen…`;
+        const pages = await fetchAllPagesForYear(y);
+        statusEl.textContent = `Jahr ${y}: ${pages.length} Seite(n) geladen`;
+        allPages.push({ year: y, pages });
+        await sleep(150);
+      }
+
+      let allOrders = [];
+      for (const set of allPages) {
+        statusEl.textContent = `Jahr ${set.year}: extrahiere ${set.pages.length} Seite(n)…`;
+        for (const doc of set.pages) {
+          allOrders = allOrders.concat(extractOrdersFromDoc(doc, set.year));
+          await sleep(10);
+        }
+      }
+
+      renderReport(allOrders);
+      statusEl.textContent = 'Fertig';
+    } catch (e) {
+      console.error('[AMZ Orders] Fehler:', e);
+      statusEl.textContent = 'Fehler – Details in Konsole (F12)';
+      alert('Es ist ein Fehler aufgetreten. Bitte in der Konsole nachsehen (F12).');
+    } finally {
+      btn.disabled = false; btn.textContent = 'Orders ➜ Export';
+    }
+  });
+})();
